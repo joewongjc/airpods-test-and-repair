@@ -6,6 +6,9 @@ A native macOS diagnostic and repair tool for AirPods.
 
 When your AirPods connect but produce no sound, distorted audio, or microphone issues, this app helps you diagnose and fix the problem without restarting your Mac.
 
+Recommended path: download the packaged app from GitHub Releases and run it directly.
+Advanced runtime, packaging, and source-build notes live in [RUNTIME.md](RUNTIME.md).
+
 ## Features
 
 ### Device Detection & Battery
@@ -57,7 +60,7 @@ Real-time microphone level monitoring with:
 
 **3. Hard Fix** - Bluetooth reconnect
 
-- Disconnects AirPods via `blueutil`
+- Disconnects AirPods via bundled `blueutil` in packaged releases, or a system-installed `blueutil` in local builds
 - Waits for Bluetooth handshake to fully close
 - Reconnects and rebuilds audio channels
 - Runs diagnostics after reconnection to verify
@@ -69,21 +72,23 @@ The app exposes these levels through a single **One-Click Repair** action and st
 
 Expandable log panel with timestamped entries showing every action taken - useful for understanding what went wrong and verifying the fix.
 
+## Download
+
+For end users, the recommended path is:
+
+1. Download the latest packaged `.dmg` from GitHub Releases
+2. Open the disk image
+3. Drag `AirPods Fix.app` into `Applications`
+4. Open the app normally
+
 ## Requirements
 
 - macOS 13 (Ventura) or later
-- [blueutil](https://github.com/toy/blueutil) - for Bluetooth control (`brew install blueutil`)
 - AirPods (any generation) or AirPods Pro
 
-## Build
+## Build From Source
 
-```bash
-git clone https://github.com/joewongjc/airpods-test-and-repair.git
-cd airpods-test-and-repair
-./build.sh
-```
-
-No Xcode required - just the Swift toolchain that comes with Xcode Command Line Tools.
+Source-build and release-packaging details are documented in [RUNTIME.md](RUNTIME.md).
 
 ## Install
 
@@ -121,7 +126,7 @@ Or simply double-click the `.app` to run without installing.
 
 ## How It Works
 
-The app is a single-file SwiftUI application (~1200 lines) that uses:
+The app is a single-file SwiftUI application (~1800 lines) that uses:
 
 - **CoreAudio API** for direct audio device switching (faster and more reliable than AppleScript)
 - **AVFoundation** for real-time microphone level monitoring

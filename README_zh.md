@@ -6,6 +6,9 @@
 
 AirPods 连上了但没声音、音质不对、麦克风不好使？这个工具帮你定位问题并修复，不用重启 Mac。
 
+推荐路径：直接从 GitHub Releases 下载打包好的 app 并运行。
+更详细的运行时、打包和源码构建说明放在 [RUNTIME.md](RUNTIME.md)。
+
 ## 功能
 
 ### 设备检测与电量
@@ -57,7 +60,7 @@ AirPods 连上了但没声音、音质不对、麦克风不好使？这个工具
 
 **3. 硬修复** - 蓝牙重连
 
-- 通过 `blueutil` 断开 AirPods
+- 在打包发布版中使用内置 `blueutil`，本地构建则使用系统里的 `blueutil`
 - 等待蓝牙握手完全关闭
 - 重新连接并重建音频通道
 - 连接后运行诊断验证结果
@@ -69,21 +72,23 @@ AirPods 连上了但没声音、音质不对、麦克风不好使？这个工具
 
 可展开的日志面板，带时间戳，记录每一步操作，方便排查问题。
 
-## 系统要求
+## 下载使用
+
+对终端用户，推荐直接：
+
+1. 从 GitHub Releases 下载最新 `.dmg`
+2. 打开磁盘镜像
+3. 把 `AirPods Fix.app` 拖到 `Applications`
+4. 正常打开应用
+
+## 运行要求
 
 - macOS 13 (Ventura) 或更高版本
-- [blueutil](https://github.com/toy/blueutil) - 蓝牙控制工具（`brew install blueutil`）
 - AirPods（任何一代）或 AirPods Pro
 
-## 构建
+## 从源码构建
 
-```bash
-git clone https://github.com/joewongjc/airpods-test-and-repair.git
-cd airpods-test-and-repair
-./build.sh
-```
-
-不需要 Xcode，只要 Xcode Command Line Tools 里自带的 Swift 工具链。
+源码构建和发布打包的细节见 [RUNTIME.md](RUNTIME.md)。
 
 ## 安装
 
@@ -121,7 +126,7 @@ sudo cp -r "AirPods Fix.app" /Applications/
 
 ## 工作原理
 
-这是一个单文件 SwiftUI 应用（约 1200 行），使用：
+这是一个单文件 SwiftUI 应用（约 1800 行），使用：
 
 - **CoreAudio API** 直接切换音频设备（比 AppleScript 更快更稳）
 - **AVFoundation** 实时麦克风电平监测

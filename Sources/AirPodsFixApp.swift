@@ -138,13 +138,60 @@ struct ShellCommandResult {
     var succeeded: Bool { status == 0 }
 }
 
-func runShell(_ command: String) -> ShellCommandResult {
+func commandSearchPaths() -> [String] {
+    let preferred = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+    let environmentPaths = (ProcessInfo.processInfo.environment["PATH"] ?? "")
+        .split(separator: ":")
+        .map(String.init)
+
+    var result: [String] = []
+    for path in preferred + environmentPaths where !path.isEmpty {
+        if !result.contains(path) {
+            result.append(path)
+        }
+    }
+    return result
+}
+
+func bundledToolURL(named name: String) -> URL? {
+    guard let resourceURL = Bundle.main.resourceURL else { return nil }
+    let candidate = resourceURL.appendingPathComponent("bin/\(name)")
+    return FileManager.default.isExecutableFile(atPath: candidate.path) ? candidate : nil
+}
+
+func resolvedToolURL(named name: String) -> URL? {
+    if let bundled = bundledToolURL(named: name) {
+        return bundled
+    }
+
+    for basePath in commandSearchPaths() {
+        let candidate = URL(fileURLWithPath: basePath).appendingPathComponent(name)
+        if FileManager.default.isExecutableFile(atPath: candidate.path) {
+            return candidate
+        }
+    }
+
+    return nil
+}
+
+func runProcess(
+    executableURL: URL,
+    arguments: [String],
+    environment: [String: String] = [:]
+) -> ShellCommandResult {
     let process = Process()
     let pipe = Pipe()
-    process.executableURL = URL(fileURLWithPath: "/bin/bash")
-    process.arguments = ["-c", "export PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"; " + command]
+    process.executableURL = executableURL
+    process.arguments = arguments
     process.standardOutput = pipe
     process.standardError = pipe
+    if !environment.isEmpty {
+        var mergedEnvironment = ProcessInfo.processInfo.environment
+        for (key, value) in environment {
+            mergedEnvironment[key] = value
+        }
+        process.environment = mergedEnvironment
+    }
     do {
         try process.run()
         process.waitUntilExit()
@@ -154,6 +201,25 @@ func runShell(_ command: String) -> ShellCommandResult {
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     return ShellCommandResult(output: output, status: process.terminationStatus)
+}
+
+func runShell(_ command: String) -> ShellCommandResult {
+    runProcess(
+        executableURL: URL(fileURLWithPath: "/bin/bash"),
+        arguments: ["-c", command],
+        environment: ["PATH": commandSearchPaths().joined(separator: ":")]
+    )
+}
+
+func runTool(named name: String, arguments: [String]) -> ShellCommandResult {
+    guard let executableURL = resolvedToolURL(named: name) else {
+        return ShellCommandResult(output: "\(name) not found", status: 127)
+    }
+    return runProcess(executableURL: executableURL, arguments: arguments)
+}
+
+func runBlueutil(_ arguments: [String]) -> ShellCommandResult {
+    runTool(named: "blueutil", arguments: arguments)
 }
 
 func shell(_ command: String) -> String {
@@ -439,6 +505,7 @@ class DiagnosticEngine: ObservableObject {
     @Published var isFixing = false
     @Published var bluetoothOn = true
     @Published var allDevices: [AirPodsDevice] = []
+    private var hasLoggedMissingBlueutil = false
 
     struct LogEntry: Identifiable {
         let id = UUID()
@@ -458,6 +525,24 @@ class DiagnosticEngine: ObservableObject {
 
     private func selectedDeviceLabel(for device: AirPodsDevice) -> String {
         allDevices.count > 1 ? device.pickerLabel : device.name
+    }
+
+    private func blueutilGuidance() -> String {
+        "未找到 blueutil；请使用预编译发布版，或先安装 blueutil（brew install blueutil）"
+    }
+
+    private func noteMissingBlueutilIfNeeded() {
+        guard !hasLoggedMissingBlueutil else { return }
+        hasLoggedMissingBlueutil = true
+        log("蓝牙重连功能受限，\(blueutilGuidance())")
+    }
+
+    private func ensureBlueutilAvailable(for feature: String) -> Bool {
+        guard resolvedToolURL(named: "blueutil") != nil else {
+            log("\(feature) 需要 blueutil，\(blueutilGuidance())", isError: true)
+            return false
+        }
+        return true
     }
 
     private func commandFailureSuffix(_ result: ShellCommandResult) -> String {
@@ -509,9 +594,12 @@ class DiagnosticEngine: ObservableObject {
 
         DispatchQueue.global(qos: .userInitiated).async { [self] in
             let previousDeviceID = device?.id
-            let btPower = runShell("blueutil --power")
+            let btPower = runBlueutil(["--power"])
             let btSysProf = runShell("system_profiler SPBluetoothDataType | head -5")
-            let hasBTOn = btPower.output.trimmingCharacters(in: .whitespacesAndNewlines) == "1"
+            if btPower.status == 127 {
+                noteMissingBlueutilIfNeeded()
+            }
+            let hasBTOn = btPower.succeeded && btPower.output.trimmingCharacters(in: .whitespacesAndNewlines) == "1"
                 || btSysProf.output.contains("State: On")
             log("蓝牙: \(hasBTOn ? "已开启" : "未开启")")
             DispatchQueue.main.async { self.bluetoothOn = hasBTOn }
@@ -790,6 +878,7 @@ class DiagnosticEngine: ObservableObject {
 
     // 硬修复: 断开重连蓝牙
     func reconnectBluetooth() {
+        guard ensureBlueutilAvailable(for: "蓝牙重连") else { return }
         guard let dev = device else {
             log("未找到可修复的设备", isError: true); return
         }
@@ -799,10 +888,11 @@ class DiagnosticEngine: ObservableObject {
         beginFix()
         DispatchQueue.global(qos: .userInitiated).async { [self] in
             step("断开 AirPods...", progress: 0.1)
-            let disconnectSucceeded = runCommand(
-                "blueutil --disconnect \"\(safeMac)\"",
-                failureMessage: "断开蓝牙设备失败"
-            )
+            let disconnectResult = runBlueutil(["--disconnect", safeMac])
+            let disconnectSucceeded = disconnectResult.succeeded
+            if !disconnectSucceeded {
+                log("断开蓝牙设备失败\(commandFailureSuffix(disconnectResult))", isError: true)
+            }
 
             step("等待断开完成...", progress: 0.2)
             Thread.sleep(forTimeInterval: 1.5)
@@ -810,10 +900,9 @@ class DiagnosticEngine: ObservableObject {
             Thread.sleep(forTimeInterval: 1.5)
 
             step("重新连接 AirPods...", progress: 0.4)
-            guard runCommand(
-                "blueutil --connect \"\(safeMac)\"",
-                failureMessage: "重新连接蓝牙设备失败"
-            ) else {
+            let reconnectResult = runBlueutil(["--connect", safeMac])
+            guard reconnectResult.succeeded else {
+                log("重新连接蓝牙设备失败\(commandFailureSuffix(reconnectResult))", isError: true)
                 step(disconnectSucceeded ? "蓝牙重连失败" : "蓝牙断开/重连失败", progress: 1.0)
                 endFix()
                 return
@@ -897,6 +986,12 @@ class DiagnosticEngine: ObservableObject {
             }
 
             // ===== 阶段 3: 硬修复 (60% ~ 100%) =====
+            guard ensureBlueutilAvailable(for: "蓝牙重连") else {
+                step("未找到 blueutil，无法执行蓝牙重连", progress: 1.0)
+                endFix()
+                return
+            }
+
             guard let safeMac = sanitizedBluetoothAddress(for: dev) else {
                 step("中修复未解决，但无法获取蓝牙地址", progress: 1.0)
                 endFix()
@@ -904,18 +999,18 @@ class DiagnosticEngine: ObservableObject {
             }
 
             step("中修复未解决，断开蓝牙...", progress: 0.65)
-            let disconnectSucceeded = runCommand(
-                "blueutil --disconnect \"\(safeMac)\"",
-                failureMessage: "断开蓝牙设备失败"
-            )
+            let disconnectResult = runBlueutil(["--disconnect", safeMac])
+            let disconnectSucceeded = disconnectResult.succeeded
+            if !disconnectSucceeded {
+                log("断开蓝牙设备失败\(commandFailureSuffix(disconnectResult))", isError: true)
+            }
 
             step("等待蓝牙断开...", progress: 0.72)
             Thread.sleep(forTimeInterval: 1.5)
             step("重新连接 AirPods...", progress: 0.78)
-            guard runCommand(
-                "blueutil --connect \"\(safeMac)\"",
-                failureMessage: "重新连接蓝牙设备失败"
-            ) else {
+            let reconnectResult = runBlueutil(["--connect", safeMac])
+            guard reconnectResult.succeeded else {
+                log("重新连接蓝牙设备失败\(commandFailureSuffix(reconnectResult))", isError: true)
                 step(disconnectSucceeded ? "硬修复执行失败" : "硬修复未能完成蓝牙重连", progress: 1.0)
                 endFix()
                 return
