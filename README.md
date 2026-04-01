@@ -11,6 +11,7 @@ When your AirPods connect but produce no sound, distorted audio, or microphone i
 ### Device Detection & Battery
 
 - Auto-detects all connected AirPods via Bluetooth
+- Lets you choose the target pair when multiple AirPods are connected at the same time
 - Shows real-time battery levels for left earbud, right earbud, and charging case
 - Displays connection status with color-coded indicators (green/yellow/red)
 
@@ -23,7 +24,7 @@ When your AirPods connect but produce no sound, distorted audio, or microphone i
   - **Mono 24kHz**: Reduced quality, usually a routing issue
   - **Voice call mode** (8kHz/16kHz): Mic active, lower speaker quality
 - Monitors system volume and mute status
-- Flags issues: wrong output device, muted audio, extremely low volume
+- Flags issues: wrong output device, degraded mono/call mode, muted audio, extremely low volume
 
 ### Speaker Test
 
@@ -62,6 +63,7 @@ Real-time microphone level monitoring with:
 - Runs diagnostics after reconnection to verify
 
 Each repair level shows a real-time progress bar with step descriptions.
+The app exposes these levels through a single **One-Click Repair** action and stops as soon as a stage resolves the issue.
 
 ### Diagnostic Log
 
@@ -101,10 +103,11 @@ Or simply double-click the `.app` to run without installing.
 
 1. Connect your AirPods to your Mac
 2. Open the app - it auto-scans for connected AirPods
-3. Check the diagnostic panel for any issues (red indicators)
-4. Use **Speaker Test** to verify audio output
-5. Use **Microphone Test** to verify mic input
-6. If something's wrong, hit **Restart Audio Service** to fix it
+3. If multiple pairs are connected, choose the target pair from the device picker
+4. Check the diagnostic panel for any issues (red indicators)
+5. Use **Speaker Test** to verify audio output
+6. Use **Microphone Test** to verify mic input
+7. If something's wrong, hit **One-Click Repair** to escalate through the repair levels automatically
 
 ### When to use each repair level
 

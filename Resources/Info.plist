@@ -21,6 +21,6 @@
 	<key>NSMicrophoneUsageDescription</key>
 	<string>AirPods Fix 需要麦克风权限来测试 AirPods 麦克风是否正常工作</string>
 	<key>LSUIElement</key>
-	<true/>
+	<false/>
 </dict>
 </plist>

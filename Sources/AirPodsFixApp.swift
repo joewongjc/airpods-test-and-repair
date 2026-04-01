@@ -5,13 +5,34 @@ import CoreAudio
 
 // MARK: - 数据模型
 
-struct AirPodsDevice: Identifiable {
-    let id = UUID()
+struct AirPodsDevice: Identifiable, Hashable {
+    let id: String
     let name: String
     let batteryLeft: String
     let batteryRight: String
     let batteryCase: String
     let macAddress: String
+
+    init(name: String, batteryLeft: String, batteryRight: String, batteryCase: String, macAddress: String) {
+        self.name = name
+        self.batteryLeft = batteryLeft
+        self.batteryRight = batteryRight
+        self.batteryCase = batteryCase
+        self.macAddress = macAddress
+        let normalizedMAC = normalizeHardwareIdentifier(macAddress)
+        self.id = normalizedMAC.isEmpty ? normalizeAudioDeviceName(name) : normalizedMAC
+    }
+
+    var shortAddress: String? {
+        let normalizedMAC = normalizeHardwareIdentifier(macAddress)
+        guard normalizedMAC.count >= 4 else { return nil }
+        return String(normalizedMAC.suffix(4)).uppercased()
+    }
+
+    var pickerLabel: String {
+        guard let shortAddress else { return name }
+        return "\(name) · \(shortAddress)"
+    }
 }
 
 struct AudioDiagnosis {
@@ -20,11 +41,26 @@ struct AudioDiagnosis {
     var sampleRate = "?"
     var volume = "?"
     var isMuted = false
-    var hasIssue: Bool {
-        return !isDefaultOutput || isMuted || (Int(volume) ?? 50) < 5
+
+    var channelCount: Int? { Int(outputChannels) }
+    var sampleRateHz: Int? { Int(sampleRate) }
+    var volumePercent: Int? { Int(volume) }
+
+    var isLowVolume: Bool {
+        (volumePercent ?? 50) < 5
     }
+
+    var isReducedQualityMode: Bool {
+        guard let ch = channelCount, let sr = sampleRateHz else { return false }
+        return ch < 2 || sr < 44100
+    }
+
+    var hasIssue: Bool {
+        !isDefaultOutput || isMuted || isLowVolume || isReducedQualityMode
+    }
+
     var modeLabel: String {
-        guard let ch = Int(outputChannels), let sr = Int(sampleRate) else { return "未知" }
+        guard let ch = channelCount, let sr = sampleRateHz else { return "未知" }
         if ch >= 2 && sr >= 44100 { return "立体声 \(sr/1000)kHz" }
         if ch == 1 && sr == 24000 { return "单声道 24kHz" }
         if ch == 1 && (sr == 8000 || sr == 16000) { return "通话模式 \(sr/1000)kHz" }
@@ -34,17 +70,94 @@ struct AudioDiagnosis {
 
 // MARK: - Shell 工具
 
-func shell(_ command: String) -> String {
+func normalizeAudioDeviceName(_ value: String) -> String {
+    value
+        .replacingOccurrences(of: "\u{2018}", with: "'")
+        .replacingOccurrences(of: "\u{2019}", with: "'")
+        .replacingOccurrences(of: "\u{201C}", with: "\"")
+        .replacingOccurrences(of: "\u{201D}", with: "\"")
+        .replacingOccurrences(of: ":", with: "")
+        .lowercased()
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+func normalizeHardwareIdentifier(_ value: String) -> String {
+    normalizeAudioDeviceName(value)
+        .replacingOccurrences(of: ":", with: "")
+        .replacingOccurrences(of: "-", with: "")
+        .replacingOccurrences(of: " ", with: "")
+}
+
+func lineIndentation(_ line: String) -> Int {
+    line.prefix { $0 == " " || $0 == "\t" }.count
+}
+
+func bluetoothDeviceBlocks(from output: String) -> [(name: String, lines: [String])] {
+    let allLines = output.components(separatedBy: "\n")
+    var blocks: [(name: String, lines: [String])] = []
+    var index = 0
+
+    while index < allLines.count {
+        let line = allLines[index]
+        let trimmedLine = line.trimmingCharacters(in: .whitespaces)
+        let indentation = lineIndentation(line)
+
+        guard trimmedLine.hasSuffix(":"), indentation >= 8 else {
+            index += 1
+            continue
+        }
+
+        let name = String(trimmedLine.dropLast())
+        var blockLines: [String] = []
+        var nextIndex = index + 1
+
+        while nextIndex < allLines.count {
+            let nextLine = allLines[nextIndex]
+            let trimmedNextLine = nextLine.trimmingCharacters(in: .whitespaces)
+            let nextIndentation = lineIndentation(nextLine)
+
+            if trimmedNextLine.hasSuffix(":"), nextIndentation <= indentation {
+                break
+            }
+
+            blockLines.append(trimmedNextLine)
+            nextIndex += 1
+        }
+
+        blocks.append((name: name, lines: blockLines))
+        index = nextIndex
+    }
+
+    return blocks
+}
+
+struct ShellCommandResult {
+    let output: String
+    let status: Int32
+
+    var succeeded: Bool { status == 0 }
+}
+
+func runShell(_ command: String) -> ShellCommandResult {
     let process = Process()
     let pipe = Pipe()
-    process.launchPath = "/bin/bash"
+    process.executableURL = URL(fileURLWithPath: "/bin/bash")
     process.arguments = ["-c", "export PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"; " + command]
     process.standardOutput = pipe
     process.standardError = pipe
-    process.launch()
-    process.waitUntilExit()
+    do {
+        try process.run()
+        process.waitUntilExit()
+    } catch {
+        return ShellCommandResult(output: error.localizedDescription, status: -1)
+    }
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
-    return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return ShellCommandResult(output: output, status: process.terminationStatus)
+}
+
+func shell(_ command: String) -> String {
+    runShell(command).output
 }
 
 // MARK: - CoreAudio 设备切换
@@ -52,7 +165,111 @@ func shell(_ command: String) -> String {
 struct AudioOutputDevice {
     let id: AudioDeviceID
     let name: String
+    let uid: String
+    let modelUID: String
+    let transportType: UInt32
     let isOutput: Bool
+
+    var isBluetoothTransport: Bool {
+        transportType == kAudioDeviceTransportTypeBluetooth || transportType == kAudioDeviceTransportTypeBluetoothLE
+    }
+}
+
+enum AudioOutputMatch {
+    case matched(AudioOutputDevice)
+    case ambiguous([AudioOutputDevice])
+    case notFound
+}
+
+func audioObjectStringProperty(
+    objectID: AudioObjectID,
+    selector: AudioObjectPropertySelector,
+    scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal
+) -> String? {
+    var address = AudioObjectPropertyAddress(
+        mSelector: selector,
+        mScope: scope,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var value: CFString = "" as CFString
+    var size = UInt32(MemoryLayout<CFString>.size)
+    let status = withUnsafeMutableBytes(of: &value) { rawBuffer in
+        AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, rawBuffer.baseAddress!)
+    }
+    guard status == noErr else { return nil }
+    return value as String
+}
+
+func audioObjectUInt32Property(
+    objectID: AudioObjectID,
+    selector: AudioObjectPropertySelector,
+    scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal
+) -> UInt32? {
+    var address = AudioObjectPropertyAddress(
+        mSelector: selector,
+        mScope: scope,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var value: UInt32 = 0
+    var size = UInt32(MemoryLayout<UInt32>.size)
+    guard AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &value) == noErr else { return nil }
+    return value
+}
+
+func audioObjectFloat64Property(
+    objectID: AudioObjectID,
+    selector: AudioObjectPropertySelector,
+    scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal
+) -> Double? {
+    var address = AudioObjectPropertyAddress(
+        mSelector: selector,
+        mScope: scope,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var value: Double = 0
+    var size = UInt32(MemoryLayout<Double>.size)
+    guard AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &value) == noErr else { return nil }
+    return value
+}
+
+func outputChannelCount(for deviceID: AudioDeviceID) -> Int? {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyStreamConfiguration,
+        mScope: kAudioDevicePropertyScopeOutput,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var dataSize: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &dataSize) == noErr else { return nil }
+
+    let rawPointer = UnsafeMutableRawPointer.allocate(
+        byteCount: Int(dataSize),
+        alignment: MemoryLayout<AudioBufferList>.alignment
+    )
+    defer { rawPointer.deallocate() }
+
+    guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &dataSize, rawPointer) == noErr else { return nil }
+    let bufferList = UnsafeMutableAudioBufferListPointer(rawPointer.assumingMemoryBound(to: AudioBufferList.self))
+    let channels = bufferList.reduce(0) { $0 + Int($1.mNumberChannels) }
+    return channels > 0 ? channels : nil
+}
+
+func defaultOutputDeviceID() -> AudioDeviceID? {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var deviceID = AudioDeviceID(kAudioObjectUnknown)
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    guard AudioObjectGetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject),
+        &address,
+        0,
+        nil,
+        &size,
+        &deviceID
+    ) == noErr, deviceID != AudioDeviceID(kAudioObjectUnknown) else { return nil }
+    return deviceID
 }
 
 func listAudioOutputDevices() -> [AudioOutputDevice] {
@@ -70,48 +287,146 @@ func listAudioOutputDevices() -> [AudioOutputDevice] {
 
     var result: [AudioOutputDevice] = []
     for did in deviceIDs {
-        // 获取设备名
-        var nameAddr = AudioObjectPropertyAddress(mSelector: kAudioObjectPropertyName, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        var cfName: CFString = "" as CFString
-        var nameSize = UInt32(MemoryLayout<CFString>.size)
-        guard AudioObjectGetPropertyData(did, &nameAddr, 0, nil, &nameSize, &cfName) == noErr else { continue }
+        guard
+            let name = audioObjectStringProperty(objectID: did, selector: kAudioObjectPropertyName),
+            let uid = audioObjectStringProperty(objectID: did, selector: kAudioDevicePropertyDeviceUID),
+            let transportType = audioObjectUInt32Property(objectID: did, selector: kAudioDevicePropertyTransportType),
+            outputChannelCount(for: did) != nil
+        else { continue }
 
-        // 检查是否有输出通道
-        var streamAddr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreams, mScope: kAudioDevicePropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
-        var streamSize: UInt32 = 0
-        AudioObjectGetPropertyDataSize(did, &streamAddr, 0, nil, &streamSize)
-
-        if streamSize > 0 {
-            result.append(AudioOutputDevice(id: did, name: cfName as String, isOutput: true))
-        }
+        let modelUID = audioObjectStringProperty(objectID: did, selector: kAudioDevicePropertyModelUID) ?? ""
+        result.append(
+            AudioOutputDevice(
+                id: did,
+                name: name,
+                uid: uid,
+                modelUID: modelUID,
+                transportType: transportType,
+                isOutput: true
+            )
+        )
     }
     return result
 }
 
-@discardableResult
-func switchOutputDevice(toNameContaining keyword: String) -> Bool {
-    let devices = listAudioOutputDevices()
-    // 用归一化匹配 (处理 Unicode 引号)
-    let normalizedKeyword = keyword
-        .replacingOccurrences(of: "\u{2018}", with: "'")
-        .replacingOccurrences(of: "\u{2019}", with: "'")
-    guard let target = devices.first(where: {
-        $0.name.replacingOccurrences(of: "\u{2018}", with: "'")
-              .replacingOccurrences(of: "\u{2019}", with: "'")
-              .contains(normalizedKeyword)
-    }) else { return false }
+func defaultOutputDevice() -> AudioOutputDevice? {
+    guard let deviceID = defaultOutputDeviceID() else { return nil }
+    return listAudioOutputDevices().first(where: { $0.id == deviceID })
+}
 
+func nominalSampleRate(for deviceID: AudioDeviceID) -> Int? {
+    guard let sampleRate = audioObjectFloat64Property(objectID: deviceID, selector: kAudioDevicePropertyNominalSampleRate) else {
+        return nil
+    }
+    return Int(sampleRate.rounded())
+}
+
+func audioOutputMatchScore(for candidate: AudioOutputDevice, target: AirPodsDevice) -> Int {
+    let normalizedTargetName = normalizeAudioDeviceName(target.name)
+    let normalizedTargetMAC = normalizeHardwareIdentifier(target.macAddress)
+    let candidateName = normalizeAudioDeviceName(candidate.name)
+    let candidateUID = normalizeHardwareIdentifier(candidate.uid)
+    let candidateModelUID = normalizeHardwareIdentifier(candidate.modelUID)
+
+    let hasExactNameMatch = candidateName == normalizedTargetName
+    let hasPartialNameMatch = candidateName.contains(normalizedTargetName) || normalizedTargetName.contains(candidateName)
+    let hasMACMatch =
+        !normalizedTargetMAC.isEmpty &&
+        (candidateUID.contains(normalizedTargetMAC) || candidateModelUID.contains(normalizedTargetMAC))
+    let hasAirPodsSignal =
+        candidateName.contains("airpods") ||
+        candidateUID.contains("airpods") ||
+        candidateModelUID.contains("airpods")
+
+    guard hasExactNameMatch || hasPartialNameMatch || hasMACMatch || hasAirPodsSignal else {
+        return 0
+    }
+
+    var score = 0
+    if candidate.isBluetoothTransport { score += 40 }
+    if hasAirPodsSignal { score += 20 }
+    if hasPartialNameMatch { score += 80 }
+    if hasExactNameMatch { score += 80 }
+    if hasMACMatch { score += 200 }
+    return score
+}
+
+func matchAudioOutputDevice(for device: AirPodsDevice) -> AudioOutputMatch {
+    let rankedMatches = listAudioOutputDevices()
+        .compactMap { candidate -> (AudioOutputDevice, Int)? in
+            let score = audioOutputMatchScore(for: candidate, target: device)
+            return score > 0 ? (candidate, score) : nil
+        }
+        .sorted { lhs, rhs in
+            if lhs.1 != rhs.1 { return lhs.1 > rhs.1 }
+            return lhs.0.isBluetoothTransport && !rhs.0.isBluetoothTransport
+        }
+
+    guard let best = rankedMatches.first else { return .notFound }
+
+    let topMatches = rankedMatches
+        .filter { $0.1 == best.1 }
+        .map(\.0)
+
+    if topMatches.count > 1 {
+        return .ambiguous(topMatches)
+    }
+    return .matched(best.0)
+}
+
+@discardableResult
+func switchOutputDevice(to device: AudioOutputDevice) -> Bool {
     var defaultAddr = AudioObjectPropertyAddress(
         mSelector: kAudioHardwarePropertyDefaultOutputDevice,
         mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMain
     )
-    var deviceID = target.id
+    var deviceID = device.id
     let status = AudioObjectSetPropertyData(
         AudioObjectID(kAudioObjectSystemObject), &defaultAddr, 0, nil,
         UInt32(MemoryLayout<AudioDeviceID>.size), &deviceID
     )
     return status == noErr
+}
+
+@discardableResult
+func switchOutputDevice(toNameContaining keyword: String) -> Bool {
+    let devices = listAudioOutputDevices()
+    let normalizedKeyword = normalizeAudioDeviceName(keyword)
+    guard let target = devices.first(where: {
+        normalizeAudioDeviceName($0.name).contains(normalizedKeyword)
+    }) else { return false }
+    return switchOutputDevice(to: target)
+}
+
+func fallbackAudioOutputDevice(excluding deviceName: String) -> AudioOutputDevice? {
+    let devices = listAudioOutputDevices()
+    let normalizedTarget = normalizeAudioDeviceName(deviceName)
+    let priorityKeywords = ["macbook", "built-in", "内置", "speaker", "speakers", "扬声器"]
+
+    func isTargetDevice(_ candidate: AudioOutputDevice) -> Bool {
+        let normalizedCandidate = normalizeAudioDeviceName(candidate.name)
+        return normalizedCandidate == normalizedTarget
+            || normalizedCandidate.contains(normalizedTarget)
+            || normalizedTarget.contains(normalizedCandidate)
+    }
+
+    if let preferred = devices.first(where: { candidate in
+        let normalizedCandidate = normalizeAudioDeviceName(candidate.name)
+        return !isTargetDevice(candidate)
+            && priorityKeywords.contains(where: { normalizedCandidate.contains($0) })
+    }) {
+        return preferred
+    }
+
+    if let nonAirPods = devices.first(where: { candidate in
+        let normalizedCandidate = normalizeAudioDeviceName(candidate.name)
+        return !isTargetDevice(candidate) && !normalizedCandidate.contains("airpods")
+    }) {
+        return nonAirPods
+    }
+
+    return devices.first(where: { !isTargetDevice($0) })
 }
 
 // MARK: - 诊断引擎
@@ -141,16 +456,63 @@ class DiagnosticEngine: ObservableObject {
         DispatchQueue.main.async { self.logs.append(entry) }
     }
 
+    private func selectedDeviceLabel(for device: AirPodsDevice) -> String {
+        allDevices.count > 1 ? device.pickerLabel : device.name
+    }
+
+    private func commandFailureSuffix(_ result: ShellCommandResult) -> String {
+        let trimmedOutput = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedOutput.isEmpty else { return "（退出码 \(result.status)）" }
+        return "：\(trimmedOutput)"
+    }
+
+    @discardableResult
+    private func runCommand(_ command: String, failureMessage: String) -> Bool {
+        let result = runShell(command)
+        guard result.succeeded else {
+            log("\(failureMessage)\(commandFailureSuffix(result))", isError: true)
+            return false
+        }
+        return true
+    }
+
+    private func restartCoreAudioService() -> Bool {
+        let nonInteractiveSudo = runShell("sudo -n killall coreaudiod")
+        if nonInteractiveSudo.succeeded {
+            return true
+        }
+
+        let directKill = runShell("killall coreaudiod")
+        if directKill.succeeded {
+            return true
+        }
+
+        let preferredFailure = nonInteractiveSudo.output.isEmpty ? directKill : nonInteractiveSudo
+        log("无法重启音频服务\(commandFailureSuffix(preferredFailure))", isError: true)
+        return false
+    }
+
+    func selectDevice(withID id: String) {
+        guard let selected = allDevices.first(where: { $0.id == id }) else { return }
+        guard device?.id != selected.id else { return }
+        DispatchQueue.main.async { self.device = selected }
+        log("切换目标设备: \(selectedDeviceLabel(for: selected))")
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            diagnoseAudio(for: selected)
+        }
+    }
+
     func scan() {
         isScanning = true
         logs.removeAll()
         log("开始扫描...")
 
         DispatchQueue.global(qos: .userInitiated).async { [self] in
-            let btPower = shell("blueutil --power 2>&1 || echo FAIL")
-            let btSysProf = shell("system_profiler SPBluetoothDataType 2>/dev/null | head -5")
-            let hasBTOn = btPower.trimmingCharacters(in: .whitespacesAndNewlines) == "1"
-                || btSysProf.contains("State: On")
+            let previousDeviceID = device?.id
+            let btPower = runShell("blueutil --power")
+            let btSysProf = runShell("system_profiler SPBluetoothDataType | head -5")
+            let hasBTOn = btPower.output.trimmingCharacters(in: .whitespacesAndNewlines) == "1"
+                || btSysProf.output.contains("State: On")
             log("蓝牙: \(hasBTOn ? "已开启" : "未开启")")
             DispatchQueue.main.async { self.bluetoothOn = hasBTOn }
             if !hasBTOn {
@@ -159,30 +521,36 @@ class DiagnosticEngine: ObservableObject {
                 return
             }
 
-            let btInfo = shell("system_profiler SPBluetoothDataType 2>/dev/null")
-            var devices: [AirPodsDevice] = []
-            let lines = btInfo.components(separatedBy: "\n")
-            for (i, line) in lines.enumerated() {
-                if line.contains("AirPods") && line.hasSuffix(":") {
-                    let name = line.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: ":", with: "")
-                    var battL = "-", battR = "-", battC = "-", mac = ""
-                    let searchEnd = min(i + 20, lines.count)
-                    for j in (i+1)..<searchEnd {
-                        let l = lines[j].trimmingCharacters(in: .whitespaces)
-                        if l.starts(with: "Left Battery Level:") { battL = l.components(separatedBy: ": ").last ?? "-" }
-                        if l.starts(with: "Right Battery Level:") { battR = l.components(separatedBy: ": ").last ?? "-" }
-                        if l.starts(with: "Case Battery Level:") { battC = l.components(separatedBy: ": ").last ?? "-" }
-                        if l.starts(with: "Address:") { mac = l.components(separatedBy: ": ").last ?? "" }
-                    }
-                    if battL != "-" || battR != "-" {
-                        devices.append(AirPodsDevice(name: name, batteryLeft: battL, batteryRight: battR, batteryCase: battC, macAddress: mac))
-                    }
-                }
+            let btInfoResult = runShell("system_profiler SPBluetoothDataType")
+            guard btInfoResult.succeeded else {
+                log("读取蓝牙设备信息失败\(commandFailureSuffix(btInfoResult))", isError: true)
+                DispatchQueue.main.async { self.isScanning = false }
+                return
             }
 
+            let devices = bluetoothDeviceBlocks(from: btInfoResult.output).compactMap { block -> AirPodsDevice? in
+                var battL = "-", battR = "-", battC = "-", mac = ""
+                for line in block.lines {
+                    if line.starts(with: "Left Battery Level:") { battL = line.components(separatedBy: ": ").last ?? "-" }
+                    if line.starts(with: "Right Battery Level:") { battR = line.components(separatedBy: ": ").last ?? "-" }
+                    if line.starts(with: "Case Battery Level:") { battC = line.components(separatedBy: ": ").last ?? "-" }
+                    if line.starts(with: "Address:") { mac = line.components(separatedBy: ": ").last ?? "" }
+                }
+
+                guard battL != "-" || battR != "-" else { return nil }
+                return AirPodsDevice(
+                    name: block.name,
+                    batteryLeft: battL,
+                    batteryRight: battR,
+                    batteryCase: battC,
+                    macAddress: mac
+                )
+            }
+
+            let selectedDevice = devices.first(where: { $0.id == previousDeviceID }) ?? devices.first
             DispatchQueue.main.async {
                 self.allDevices = devices
-                self.device = devices.first
+                self.device = selectedDevice
             }
 
             if devices.isEmpty {
@@ -191,70 +559,61 @@ class DiagnosticEngine: ObservableObject {
                 return
             }
 
-            self.log("已连接: \(devices.first!.name)")
-            self.diagnoseAudio(deviceName: devices.first!.name)
+            if devices.count > 1 {
+                self.log("检测到 \(devices.count) 台 AirPods，可在设备卡片中切换目标设备")
+            }
+
+            guard let selectedDevice else {
+                self.log("未找到可用的目标设备", isError: true)
+                DispatchQueue.main.async { self.isScanning = false }
+                return
+            }
+
+            self.log("已连接: \(self.selectedDeviceLabel(for: selectedDevice))")
+            self.diagnoseAudio(for: selectedDevice)
             DispatchQueue.main.async { self.isScanning = false }
         }
     }
 
-    func diagnoseAudio(deviceName: String) {
-        let audioInfo = shell("system_profiler SPAudioDataType 2>/dev/null")
+    @discardableResult
+    func diagnoseAudio(for device: AirPodsDevice) -> AudioDiagnosis {
         var diag = AudioDiagnosis()
 
-        // 按设备名切分: 找到设备名所在行，往下收集属性直到下一个设备名
-        let lines = audioInfo.components(separatedBy: "\n")
-
-        // 归一化设备名用于匹配 (处理 Unicode 智能引号等)
-        func normalize(_ s: String) -> String {
-            s.replacingOccurrences(of: "\u{2018}", with: "'")
-             .replacingOccurrences(of: "\u{2019}", with: "'")
-             .replacingOccurrences(of: "\u{201C}", with: "\"")
-             .replacingOccurrences(of: "\u{201D}", with: "\"")
-        }
-        let normalizedName = normalize(deviceName)
-
-        // 找到所有设备名出现的位置
-        var deviceBlocks: [(start: Int, isTarget: Bool)] = []
-        for (i, line) in lines.enumerated() {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            // 设备名行: 顶格缩进 + 冒号结尾，不含其他冒号
-            if trimmed.hasSuffix(":") && !trimmed.contains("Devices:") && !trimmed.contains("Audio:") {
-                let isTarget = normalize(trimmed).contains(normalizedName)
-                deviceBlocks.append((start: i, isTarget: isTarget))
+        switch matchAudioOutputDevice(for: device) {
+        case .matched(let audioOutput):
+            if let channels = outputChannelCount(for: audioOutput.id) {
+                diag.outputChannels = "\(channels)"
             }
+            if let sampleRate = nominalSampleRate(for: audioOutput.id) {
+                diag.sampleRate = "\(sampleRate)"
+            }
+            diag.isDefaultOutput = defaultOutputDeviceID() == audioOutput.id
+        case .ambiguous:
+            log("检测到多个与 \(selectedDeviceLabel(for: device)) 匹配的音频输出，请先在系统声音设置里选中目标设备", isError: true)
+        case .notFound:
+            log("未在音频输出列表中找到 \(selectedDeviceLabel(for: device))", isError: true)
         }
 
-        // 对每个目标设备块，收集到下一个设备块为止的属性
-        for (idx, block) in deviceBlocks.enumerated() {
-            guard block.isTarget else { continue }
-            let nextStart = idx + 1 < deviceBlocks.count ? deviceBlocks[idx + 1].start : lines.count
-            let blockLines = lines[(block.start)..<nextStart]
-            let blockText = blockLines.joined(separator: "\n")
-
-            // 只看包含 Output 的段
-            guard blockText.contains("Output Channels") || blockText.contains("Default Output Device") else { continue }
-
-            if blockText.contains("Default Output Device: Yes") {
-                diag.isDefaultOutput = true
-            }
-            for line in blockLines {
-                let trimmed = line.trimmingCharacters(in: .whitespaces)
-                if trimmed.starts(with: "Output Channels:") {
-                    diag.outputChannels = trimmed.components(separatedBy: ": ").last ?? "?"
-                }
-                if trimmed.starts(with: "Current SampleRate:") {
-                    diag.sampleRate = trimmed.components(separatedBy: ": ").last ?? "?"
-                }
-            }
-            if diag.isDefaultOutput { break }
+        let volumeResult = runShell("osascript -e 'output volume of (get volume settings)'")
+        if volumeResult.succeeded {
+            diag.volume = volumeResult.output
+        } else {
+            log("读取系统音量失败\(commandFailureSuffix(volumeResult))", isError: true)
         }
-        diag.volume = shell("osascript -e 'output volume of (get volume settings)' 2>/dev/null")
-        let mutedStr = shell("osascript -e 'output muted of (get volume settings)' 2>/dev/null")
-        diag.isMuted = mutedStr == "true"
+
+        let mutedResult = runShell("osascript -e 'output muted of (get volume settings)'")
+        if mutedResult.succeeded {
+            diag.isMuted = mutedResult.output == "true"
+        } else {
+            log("读取静音状态失败\(commandFailureSuffix(mutedResult))", isError: true)
+        }
+
         log("模式: \(diag.modeLabel) | 音量: \(diag.volume)%\(diag.isMuted ? " (静音)" : "")")
-        if !diag.isDefaultOutput { log("AirPods 非当前输出设备", isError: true) }
+        if !diag.isDefaultOutput { log("\(selectedDeviceLabel(for: device)) 非当前输出设备", isError: true) }
         if diag.isMuted { log("系统已静音", isError: true) }
+        if diag.isDefaultOutput, diag.isReducedQualityMode { log("当前输出模式异常：\(diag.modeLabel)", isError: true) }
         DispatchQueue.main.async { self.diagnosis = diag }
+        return diag
     }
 
     // MARK: 修复进度
@@ -298,6 +657,67 @@ class DiagnosticEngine: ObservableObject {
         }
     }
 
+    private func sanitizedBluetoothAddress(for device: AirPodsDevice) -> String? {
+        let safeMac = device.macAddress
+            .replacingOccurrences(of: "\"", with: "")
+            .replacingOccurrences(of: "'", with: "")
+            .replacingOccurrences(of: ";", with: "")
+            .replacingOccurrences(of: "&", with: "")
+            .replacingOccurrences(of: "|", with: "")
+            .replacingOccurrences(of: "`", with: "")
+            .replacingOccurrences(of: "$", with: "")
+        return safeMac.isEmpty ? nil : safeMac
+    }
+
+    @discardableResult
+    private func switchToSelectedAirPodsOutput(_ device: AirPodsDevice) -> Bool {
+        switch matchAudioOutputDevice(for: device) {
+        case .matched(let audioOutput):
+            return switchOutputDevice(to: audioOutput)
+        case .ambiguous:
+            log("无法唯一定位 \(selectedDeviceLabel(for: device)) 的音频输出，请先在系统声音设置中选中目标设备", isError: true)
+            return false
+        case .notFound:
+            log("未找到 \(selectedDeviceLabel(for: device)) 的音频输出", isError: true)
+            return false
+        }
+    }
+
+    @discardableResult
+    private func refreshAudioRoute(
+        for device: AirPodsDevice,
+        fallbackStep: String,
+        fallbackProgress: Double,
+        targetStep: String,
+        targetProgress: Double,
+        settleStep: String,
+        settleProgress: Double
+    ) -> Bool {
+        step(fallbackStep, progress: fallbackProgress)
+        if let fallback = fallbackAudioOutputDevice(excluding: device.name) {
+            if switchOutputDevice(to: fallback) {
+                log("已切换到 \(fallback.name)")
+                Thread.sleep(forTimeInterval: 1.0)
+            } else {
+                log("切换到 \(fallback.name) 失败，继续尝试重选 \(device.name)", isError: true)
+            }
+        } else {
+            log("未找到可用的备用输出，直接重选 \(device.name)")
+        }
+
+        step(targetStep, progress: targetProgress)
+        let ok = switchToSelectedAirPodsOutput(device)
+        if ok {
+            log("已切换到 \(selectedDeviceLabel(for: device))")
+        } else {
+            log("切换到 \(selectedDeviceLabel(for: device)) 失败", isError: true)
+        }
+
+        step(settleStep, progress: settleProgress)
+        Thread.sleep(forTimeInterval: 1.0)
+        return ok
+    }
+
     // 软修复: 修静音/音量/输出设备，不动 coreaudiod，不断蓝牙
     // 核心: 先切回本机扬声器，再切回 AirPods，强制刷新音频路由
     func fix() {
@@ -309,44 +729,28 @@ class DiagnosticEngine: ObservableObject {
             Thread.sleep(forTimeInterval: 0.3)
             if diagnosis.isMuted {
                 step("取消静音...", progress: 0.1)
-                _ = shell("osascript -e 'set volume without output muted'")
+                _ = runCommand("osascript -e 'set volume without output muted'", failureMessage: "取消静音失败")
             }
 
             step("检查音量...", progress: 0.15)
             Thread.sleep(forTimeInterval: 0.3)
             if let vol = Int(diagnosis.volume), vol < 10 {
                 step("调高音量至 50%...", progress: 0.2)
-                _ = shell("osascript -e 'set volume output volume 50'")
+                _ = runCommand("osascript -e 'set volume output volume 50'", failureMessage: "调整音量失败")
             }
 
-            // 核心步骤: 切换音频输出到 AirPods
-            // 先切到本机扬声器，再切回 AirPods，强制重建音频路由
-            step("切换到本机扬声器...", progress: 0.3)
-            let switched = switchOutputDevice(toNameContaining: "MacBook")
-                || switchOutputDevice(toNameContaining: "Built-in")
-                || switchOutputDevice(toNameContaining: "内置")
-            if switched {
-                log("已切换到本机扬声器")
-            } else {
-                log("未找到本机扬声器，跳过 toggle", isError: false)
-            }
-
-            step("等待音频路由切换...", progress: 0.45)
-            Thread.sleep(forTimeInterval: 1.0)
-
-            step("切换输出到 AirPods...", progress: 0.6)
-            let ok = switchOutputDevice(toNameContaining: "AirPods")
-            if ok {
-                log("已切换到 AirPods")
-            } else {
-                log("切换到 AirPods 失败", isError: true)
-            }
-
-            step("等待音频通道建立...", progress: 0.75)
-            Thread.sleep(forTimeInterval: 1.0)
+            let ok = refreshAudioRoute(
+                for: dev,
+                fallbackStep: "切换到备用输出...",
+                fallbackProgress: 0.3,
+                targetStep: "切换输出到 AirPods...",
+                targetProgress: 0.6,
+                settleStep: "等待音频通道建立...",
+                settleProgress: 0.75
+            )
 
             step("验证修复结果...", progress: 0.9)
-            self.diagnoseAudio(deviceName: dev.name)
+            self.diagnoseAudio(for: dev)
 
             if ok {
                 step("音频路由已刷新", progress: 1.0)
@@ -362,7 +766,11 @@ class DiagnosticEngine: ObservableObject {
         beginFix()
         DispatchQueue.global(qos: .userInitiated).async { [self] in
             step("停止音频服务...", progress: 0.15)
-            _ = shell("sudo killall coreaudiod 2>/dev/null || killall coreaudiod 2>/dev/null || true")
+            guard restartCoreAudioService() else {
+                step("重启音频服务失败", progress: 1.0)
+                endFix()
+                return
+            }
 
             step("等待服务重启...", progress: 0.35)
             Thread.sleep(forTimeInterval: 1.5)
@@ -372,7 +780,7 @@ class DiagnosticEngine: ObservableObject {
             step("验证音频状态...", progress: 0.8)
             Thread.sleep(forTimeInterval: 0.5)
             if let dev = device {
-                self.diagnoseAudio(deviceName: dev.name)
+                self.diagnoseAudio(for: dev)
             }
 
             step("音频服务已重启", progress: 1.0)
@@ -382,13 +790,19 @@ class DiagnosticEngine: ObservableObject {
 
     // 硬修复: 断开重连蓝牙
     func reconnectBluetooth() {
-        guard let dev = device, !dev.macAddress.isEmpty else {
-            log("无法获取蓝牙地址", isError: true); return
+        guard let dev = device else {
+            log("未找到可修复的设备", isError: true); return
+        }
+        guard let safeMac = sanitizedBluetoothAddress(for: dev) else {
+            log("蓝牙地址无效或缺失", isError: true); return
         }
         beginFix()
         DispatchQueue.global(qos: .userInitiated).async { [self] in
             step("断开 AirPods...", progress: 0.1)
-            _ = shell("blueutil --disconnect \"\(dev.macAddress)\"")
+            let disconnectSucceeded = runCommand(
+                "blueutil --disconnect \"\(safeMac)\"",
+                failureMessage: "断开蓝牙设备失败"
+            )
 
             step("等待断开完成...", progress: 0.2)
             Thread.sleep(forTimeInterval: 1.5)
@@ -396,7 +810,14 @@ class DiagnosticEngine: ObservableObject {
             Thread.sleep(forTimeInterval: 1.5)
 
             step("重新连接 AirPods...", progress: 0.4)
-            _ = shell("blueutil --connect \"\(dev.macAddress)\"")
+            guard runCommand(
+                "blueutil --connect \"\(safeMac)\"",
+                failureMessage: "重新连接蓝牙设备失败"
+            ) else {
+                step(disconnectSucceeded ? "蓝牙重连失败" : "蓝牙断开/重连失败", progress: 1.0)
+                endFix()
+                return
+            }
 
             step("等待蓝牙握手...", progress: 0.5)
             Thread.sleep(forTimeInterval: 2)
@@ -406,9 +827,111 @@ class DiagnosticEngine: ObservableObject {
             Thread.sleep(forTimeInterval: 1)
 
             step("验证连接状态...", progress: 0.9)
-            self.diagnoseAudio(deviceName: dev.name)
+            self.diagnoseAudio(for: dev)
 
             step("蓝牙重连完成", progress: 1.0)
+            endFix()
+        }
+    }
+
+    // MARK: 智能一键修复（按强度递增依次尝试）
+    func runSmartRepair() {
+        guard let dev = device else { return }
+        beginFix()
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+
+            // ===== 阶段 1: 软修复 (0% ~ 30%) =====
+            step("开始修复：检查静音状态...", progress: 0.05)
+            Thread.sleep(forTimeInterval: 0.3)
+            if diagnosis.isMuted {
+                step("取消静音...", progress: 0.08)
+                _ = runCommand("osascript -e 'set volume without output muted'", failureMessage: "取消静音失败")
+            }
+
+            step("检查音量...", progress: 0.12)
+            Thread.sleep(forTimeInterval: 0.3)
+            if let vol = Int(diagnosis.volume), vol < 10 {
+                step("调高音量至 50%...", progress: 0.15)
+                _ = runCommand("osascript -e 'set volume output volume 50'", failureMessage: "调整音量失败")
+            }
+
+            _ = refreshAudioRoute(
+                for: dev,
+                fallbackStep: "刷新音频路由...",
+                fallbackProgress: 0.20,
+                targetStep: "重选 AirPods 输出...",
+                targetProgress: 0.24,
+                settleStep: "等待音频通道建立...",
+                settleProgress: 0.28
+            )
+
+            step("软修复完成，验证状态...", progress: 0.30)
+            let softDiagnosis = self.diagnoseAudio(for: dev)
+
+            if !softDiagnosis.hasIssue {
+                step("软修复已解决问题", progress: 1.0)
+                endFix()
+                return
+            }
+
+            // ===== 阶段 2: 中修复 (30% ~ 60%) =====
+            step("软修复未解决，重启音频服务...", progress: 0.35)
+            let audioRestarted = restartCoreAudioService()
+
+            if audioRestarted {
+                step("等待服务重启...", progress: 0.45)
+                Thread.sleep(forTimeInterval: 1.5)
+                step("音频服务恢复中...", progress: 0.55)
+                Thread.sleep(forTimeInterval: 1.5)
+            } else {
+                step("无法重启音频服务，继续尝试蓝牙重连...", progress: 0.60)
+            }
+
+            step("中修复完成，验证状态...", progress: 0.60)
+            let mediumDiagnosis = self.diagnoseAudio(for: dev)
+
+            if !mediumDiagnosis.hasIssue {
+                step("中修复已解决问题", progress: 1.0)
+                endFix()
+                return
+            }
+
+            // ===== 阶段 3: 硬修复 (60% ~ 100%) =====
+            guard let safeMac = sanitizedBluetoothAddress(for: dev) else {
+                step("中修复未解决，但无法获取蓝牙地址", progress: 1.0)
+                endFix()
+                return
+            }
+
+            step("中修复未解决，断开蓝牙...", progress: 0.65)
+            let disconnectSucceeded = runCommand(
+                "blueutil --disconnect \"\(safeMac)\"",
+                failureMessage: "断开蓝牙设备失败"
+            )
+
+            step("等待蓝牙断开...", progress: 0.72)
+            Thread.sleep(forTimeInterval: 1.5)
+            step("重新连接 AirPods...", progress: 0.78)
+            guard runCommand(
+                "blueutil --connect \"\(safeMac)\"",
+                failureMessage: "重新连接蓝牙设备失败"
+            ) else {
+                step(disconnectSucceeded ? "硬修复执行失败" : "硬修复未能完成蓝牙重连", progress: 1.0)
+                endFix()
+                return
+            }
+
+            step("等待蓝牙握手与音频通道建立...", progress: 0.88)
+            Thread.sleep(forTimeInterval: 4.0)
+
+            step("硬修复完成，验证状态...", progress: 0.95)
+            let finalDiagnosis = self.diagnoseAudio(for: dev)
+
+            if finalDiagnosis.hasIssue {
+                step("所有修复尝试完毕，仍有问题，建议检查硬件", progress: 1.0)
+            } else {
+                step("硬修复已解决问题，AirPods 恢复正常", progress: 1.0)
+            }
             endFix()
         }
     }
@@ -547,6 +1070,19 @@ class DiagnosticEngine: ObservableObject {
     }
 }
 
+// MARK: - SymbolEffect 兼容性扩展
+
+extension View {
+    @ViewBuilder
+    func safeSymbolEffectPulse(isActive: Bool) -> some View {
+        if #available(macOS 14, *) {
+            self.symbolEffect(.pulse, isActive: isActive)
+        } else {
+            self
+        }
+    }
+}
+
 // MARK: - 设计系统
 
 enum DS {
@@ -638,12 +1174,16 @@ struct ContentView: View {
     @StateObject var engine = DiagnosticEngine()
     @State private var showLog = false
 
+    private func selectedDeviceTitle(_ device: AirPodsDevice) -> String {
+        engine.allDevices.count > 1 ? device.pickerLabel : device.name
+    }
+
     var body: some View {
         VStack(spacing: DS.sectionSpacing) {
             headerSection
             if let dev = engine.device {
                 deviceSection(dev)
-                diagnosisSection
+                diagnosisSection(dev)
                 audioTestSection
                 if engine.isFixing || engine.fixDone {
                     fixProgressSection
@@ -712,7 +1252,7 @@ struct ContentView: View {
             // 设备名 + 状态
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(dev.name)
+                    Text(selectedDeviceTitle(dev))
                         .font(.system(size: 13, weight: .semibold))
                     Text(engine.diagnosis.modeLabel)
                         .font(.system(size: 10, design: .rounded))
@@ -730,6 +1270,31 @@ struct ContentView: View {
                 .padding(.vertical, 4)
                 .background((engine.diagnosis.hasIssue ? Color.red : Color.green).opacity(0.1))
                 .clipShape(Capsule())
+            }
+
+            if engine.allDevices.count > 1 {
+                HStack(spacing: 10) {
+                    Text("目标设备")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Picker(
+                        "目标设备",
+                        selection: Binding(
+                            get: { engine.device?.id ?? "" },
+                            set: { engine.selectDevice(withID: $0) }
+                        )
+                    ) {
+                        ForEach(engine.allDevices) { candidate in
+                            Text(candidate.pickerLabel).tag(candidate.id)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .disabled(engine.isScanning || engine.isFixing)
+                }
+
+                Divider().opacity(0.5)
             }
 
             // 电量圆环 - 横排
@@ -752,7 +1317,7 @@ struct ContentView: View {
 
     // MARK: 诊断
 
-    var diagnosisSection: some View {
+    func diagnosisSection(_ dev: AirPodsDevice) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text("诊断")
                 .font(.system(size: 11, weight: .semibold))
@@ -763,7 +1328,7 @@ struct ContentView: View {
             DiagRow(
                 icon: engine.diagnosis.isDefaultOutput ? "checkmark.circle.fill" : "xmark.circle.fill",
                 label: "输出设备",
-                value: engine.diagnosis.isDefaultOutput ? "AirPods" : "非 AirPods",
+                value: engine.diagnosis.isDefaultOutput ? selectedDeviceTitle(dev) : "非 \(selectedDeviceTitle(dev))",
                 status: engine.diagnosis.isDefaultOutput ? .ok : .warn
             )
             Divider().opacity(0.5)
@@ -771,7 +1336,9 @@ struct ContentView: View {
                 icon: "waveform",
                 label: "音频模式",
                 value: engine.diagnosis.modeLabel,
-                status: .ok
+                status: engine.diagnosis.sampleRateHz == nil || engine.diagnosis.channelCount == nil
+                    ? .neutral
+                    : (engine.diagnosis.isReducedQualityMode ? .warn : .ok)
             )
             Divider().opacity(0.5)
             DiagRow(
@@ -814,7 +1381,7 @@ struct ContentView: View {
                     .font(.system(size: 14))
                     .foregroundColor(engine.isPlayingTest ? .accentColor : .secondary)
                     .frame(width: 20)
-                    .symbolEffect(.pulse, isActive: engine.isPlayingTest)
+                    .safeSymbolEffectPulse(isActive: engine.isPlayingTest)
                 Text("扬声器测试")
                     .font(.system(size: 12))
                     .foregroundColor(.secondary)
@@ -1008,11 +1575,11 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, alignment: .center)
 
             ActionButton(
-                title: engine.isFixing ? "修复中..." : "重启音频服务",
-                subtitle: "重启 coreaudiod，音频会短暂中断",
+                title: engine.isFixing ? "修复中..." : "一键修复 AirPods",
+                subtitle: "依次尝试：刷新音频路由 → 重启音频服务 → 重连蓝牙",
                 icon: "arrow.clockwise.circle",
                 style: .primary,
-                action: { engine.restartAudioService() }
+                action: { engine.runSmartRepair() }
             )
             .disabled(engine.isScanning || engine.isFixing)
         }

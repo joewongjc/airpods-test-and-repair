@@ -4,6 +4,7 @@ set -e
 APP_NAME="AirPods Fix"
 BUNDLE_DIR="$APP_NAME.app"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+MODULE_CACHE_DIR="$SCRIPT_DIR/.build/ModuleCache.noindex"
 
 echo "Building $APP_NAME..."
 
@@ -13,11 +14,13 @@ rm -rf "$SCRIPT_DIR/$BUNDLE_DIR"
 # Create .app bundle structure
 mkdir -p "$SCRIPT_DIR/$BUNDLE_DIR/Contents/MacOS"
 mkdir -p "$SCRIPT_DIR/$BUNDLE_DIR/Contents/Resources"
+mkdir -p "$MODULE_CACHE_DIR"
 
 # Compile Swift source
 swiftc \
     -O \
     -whole-module-optimization \
+    -module-cache-path "$MODULE_CACHE_DIR" \
     -framework Cocoa \
     -framework SwiftUI \
     -framework AVFoundation \
