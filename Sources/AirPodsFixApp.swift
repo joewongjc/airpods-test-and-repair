@@ -608,6 +608,9 @@ class DiagnosticEngine: ObservableObject {
         rawValue: UserDefaults.standard.string(forKey: DiagnosticEngine.languageDefaultsKey) ?? ""
     ) ?? .english
     private var hasLoggedMissingBlueutil = false
+    private var audioDeviceChangeObserverInstalled = false
+    private var activationObserver: Any?
+    private var lastAutoScanTime: Date = .distantPast
 
     struct LogEntry: Identifiable {
         let id = UUID()
@@ -621,7 +624,52 @@ class DiagnosticEngine: ObservableObject {
         var isMuted: Bool
     }
 
-    init() { scan() }
+    init() {
+        scan()
+        installAutoRefresh()
+    }
+
+    private func installAutoRefresh() {
+        activationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.autoScanIfNeeded()
+        }
+        installAudioDeviceChangeListener()
+    }
+
+    private func autoScanIfNeeded() {
+        guard !isScanning, !isFixing else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastAutoScanTime) > 3 else { return }
+        lastAutoScanTime = now
+        scan()
+    }
+
+    private func installAudioDeviceChangeListener() {
+        guard !audioDeviceChangeObserverInstalled else { return }
+        audioDeviceChangeObserverInstalled = true
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject),
+            &address,
+            DispatchQueue.main
+        ) { [weak self] _, _ in
+            self?.autoScanIfNeeded()
+        }
+    }
+
+    deinit {
+        if let observer = activationObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
 
     func log(_ msg: String, isError: Bool = false) {
         let fmt = DateFormatter()
@@ -897,56 +945,80 @@ class DiagnosticEngine: ObservableObject {
             let audioOutputs = listAudioOutputDevices()
             struct BluetoothScanCandidate {
                 let device: AirPodsDevice
-                let matchedOutput: AudioOutputDevice
+                let matchedOutput: AudioOutputDevice?
                 let score: Int
             }
 
+            let allBlocks = bluetoothDeviceBlocks(from: btInfoResult.output)
             var bestCandidateByOutputID: [AudioDeviceID: BluetoothScanCandidate] = [:]
-            for block in bluetoothDeviceBlocks(from: btInfoResult.output) {
+            var unmatchedCandidates: [String: BluetoothScanCandidate] = [:]
+            for block in allBlocks {
                 var battL = "-", battR = "-", battC = "-", mac = ""
+                var genericBattery: String?
                 for line in block.lines {
                     if line.starts(with: "Left Battery Level:") { battL = line.components(separatedBy: ": ").last ?? "-" }
-                    if line.starts(with: "Right Battery Level:") { battR = line.components(separatedBy: ": ").last ?? "-" }
-                    if line.starts(with: "Case Battery Level:") { battC = line.components(separatedBy: ": ").last ?? "-" }
+                    else if line.starts(with: "Right Battery Level:") { battR = line.components(separatedBy: ": ").last ?? "-" }
+                    else if line.starts(with: "Case Battery Level:") { battC = line.components(separatedBy: ": ").last ?? "-" }
+                    else if line.starts(with: "Battery Level:") { genericBattery = line.components(separatedBy: ": ").last }
                     if line.starts(with: "Address:") { mac = line.components(separatedBy: ": ").last ?? "" }
+                }
+                if battL == "-" && battR == "-", let gb = genericBattery {
+                    battL = gb; battR = gb
                 }
 
                 guard battL != "-" || battR != "-" else { continue }
-                guard let bestMatch = bestMatchingAudioOutput(
+
+                let newDevice = AirPodsDevice(
+                    name: block.name,
+                    batteryLeft: battL,
+                    batteryRight: battR,
+                    batteryCase: battC,
+                    macAddress: mac
+                )
+
+                if let bestMatch = bestMatchingAudioOutput(
                     forBluetoothName: block.name,
                     macAddress: mac,
                     among: audioOutputs
-                ) else { continue }
-
-                let candidate = BluetoothScanCandidate(
-                    device: AirPodsDevice(
-                        name: block.name,
-                        batteryLeft: battL,
-                        batteryRight: battR,
-                        batteryCase: battC,
-                        macAddress: mac
-                    ),
-                    matchedOutput: bestMatch.device,
-                    score: bestMatch.score
-                )
-
-                if let existing = bestCandidateByOutputID[candidate.matchedOutput.id] {
-                    if candidate.score > existing.score {
-                        bestCandidateByOutputID[candidate.matchedOutput.id] = candidate
+                ) {
+                    let candidate = BluetoothScanCandidate(
+                        device: newDevice,
+                        matchedOutput: bestMatch.device,
+                        score: bestMatch.score
+                    )
+                    if let existing = bestCandidateByOutputID[bestMatch.device.id] {
+                        if candidate.score > existing.score {
+                            bestCandidateByOutputID[bestMatch.device.id] = candidate
+                        }
+                    } else {
+                        bestCandidateByOutputID[bestMatch.device.id] = candidate
                     }
                 } else {
-                    bestCandidateByOutputID[candidate.matchedOutput.id] = candidate
+                    let likelyInCase = battC != "-"
+                    if !likelyInCase {
+                        let candidate = BluetoothScanCandidate(
+                            device: newDevice,
+                            matchedOutput: nil,
+                            score: 0
+                        )
+                        unmatchedCandidates[newDevice.id] = candidate
+                    }
                 }
             }
 
-            let devices = bestCandidateByOutputID.values
+            let matchedIDs = Set(bestCandidateByOutputID.values.map(\.device.id))
+            let allCandidates = bestCandidateByOutputID.values.map(\.device)
+                + unmatchedCandidates.values
+                    .filter { !matchedIDs.contains($0.device.id) }
+                    .map(\.device)
+
+            let devices = allCandidates
                 .sorted { lhs, rhs in
-                    if lhs.device.name != rhs.device.name {
-                        return lhs.device.name.localizedStandardCompare(rhs.device.name) == .orderedAscending
+                    if lhs.name != rhs.name {
+                        return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
                     }
-                    return lhs.device.id < rhs.device.id
+                    return lhs.id < rhs.id
                 }
-                .map(\.device)
 
             let selectedDevice = devices.first(where: { $0.id == previousDeviceID }) ?? devices.first
             DispatchQueue.main.async {
@@ -1151,21 +1223,26 @@ class DiagnosticEngine: ObservableObject {
         return safeMac.isEmpty ? nil : safeMac
     }
 
-    @discardableResult
-    private func switchToSelectedAirPodsOutput(_ device: AirPodsDevice) -> Bool {
-        switch matchAudioOutputDevice(for: device) {
-        case .matched(let audioOutput):
-            return switchOutputDevice(to: audioOutput)
-        case .ambiguous:
+    private func logOutputResolutionFailure(for device: AirPodsDevice, match: AudioOutputMatch) {
+        switch match {
+        case .matched:
             log(
                 lt(
-                    en: "Cannot uniquely resolve the audio output for \(selectedDeviceLabel(for: device)). Select it in System Settings first.",
-                    zh: "无法唯一定位 \(selectedDeviceLabel(for: device)) 的音频输出，请先在系统声音设置中选中目标设备",
-                    ja: "\(selectedDeviceLabel(for: device)) の音声出力を一意に特定できません。先にシステム設定で選んでください。"
+                    en: "The headset became available, but macOS still did not switch the output route",
+                    zh: "耳机输出已经出现，但 macOS 仍未切换音频路由",
+                    ja: "ヘッドセット出力は利用可能になりましたが、macOS が音声ルートを切り替えませんでした"
                 ),
                 isError: true
             )
-            return false
+        case .ambiguous:
+            log(
+                lt(
+                    en: "Multiple audio outputs match \(selectedDeviceLabel(for: device)). Select it in System Settings first.",
+                    zh: "检测到多个与 \(selectedDeviceLabel(for: device)) 匹配的音频输出，请先在系统声音设置里选中目标设备",
+                    ja: "\(selectedDeviceLabel(for: device)) に一致する音声出力が複数あります。先にシステム設定で対象を選んでください。"
+                ),
+                isError: true
+            )
         case .notFound:
             log(
                 lt(
@@ -1175,8 +1252,115 @@ class DiagnosticEngine: ObservableObject {
                 ),
                 isError: true
             )
+        }
+    }
+
+    private func waitForResolvedOutput(for device: AirPodsDevice, timeout: TimeInterval) -> AudioOutputMatch {
+        let deadline = Date().addingTimeInterval(timeout)
+        var lastMatch = matchAudioOutputDevice(for: device)
+        while Date() < deadline {
+            if case .matched = lastMatch {
+                return lastMatch
+            }
+            Thread.sleep(forTimeInterval: 0.35)
+            lastMatch = matchAudioOutputDevice(for: device)
+        }
+        return lastMatch
+    }
+
+    @discardableResult
+    private func askBluetoothToClaimDevice(for device: AirPodsDevice) -> Bool {
+        guard resolvedToolURL(named: "blueutil") != nil else {
+            noteMissingBlueutilIfNeeded()
             return false
         }
+        guard let safeMac = sanitizedBluetoothAddress(for: device) else {
+            return false
+        }
+
+        log(
+            lt(
+                en: "The headset is not active on this Mac yet. Requesting Bluetooth handoff...",
+                zh: "目标耳机还没有切到这台 Mac，尝试请求蓝牙切换...",
+                ja: "ヘッドセットはまだこの Mac で有効ではありません。Bluetooth の切り替えを要求しています..."
+            )
+        )
+
+        let connectResult = runBlueutil(["--connect", safeMac])
+        guard connectResult.succeeded else {
+            let isPermissionError = connectResult.output.contains("absence of access") || connectResult.status == 134
+            if isPermissionError {
+                log(
+                    lt(
+                        en: "Bluetooth access denied. Grant permission in System Settings → Privacy & Security → Bluetooth for AirPods Fix, then retry.",
+                        zh: "蓝牙权限被拒绝，请在「系统设置 → 隐私与安全性 → 蓝牙」中允许 AirPods Fix 访问蓝牙，然后重试",
+                        ja: "Bluetooth アクセスが拒否されました。「システム設定 → プライバシーとセキュリティ → Bluetooth」で AirPods Fix にアクセスを許可してから再試行してください。"
+                    ),
+                    isError: true
+                )
+            } else {
+                log(
+                    lt(
+                        en: "Failed to request Bluetooth handoff\(commandFailureSuffix(connectResult))",
+                        zh: "请求蓝牙切换失败\(commandFailureSuffix(connectResult))",
+                        ja: "Bluetooth の切り替え要求に失敗しました\(commandFailureSuffix(connectResult))"
+                    ),
+                    isError: true
+                )
+            }
+            return false
+        }
+
+        log(
+            lt(
+                en: "Bluetooth handoff requested. Waiting for the headset output to appear...",
+                zh: "已请求蓝牙切换，等待耳机输出出现在这台 Mac 上...",
+                ja: "Bluetooth の切り替えを要求しました。ヘッドセット出力がこの Mac に現れるのを待っています..."
+            )
+        )
+        return true
+    }
+
+    @discardableResult
+    private func switchResolvedOutputToDefault(_ audioOutput: AudioOutputDevice) -> Bool {
+        if defaultOutputDeviceID() == audioOutput.id {
+            return true
+        }
+        guard switchOutputDevice(to: audioOutput) else {
+            return false
+        }
+        Thread.sleep(forTimeInterval: 0.35)
+        let verified = defaultOutputDeviceID() == audioOutput.id
+        return verified
+    }
+
+    @discardableResult
+    private func switchToSelectedAirPodsOutput(_ device: AirPodsDevice) -> Bool {
+        let initialMatch = matchAudioOutputDevice(for: device)
+        if case .matched(let audioOutput) = initialMatch,
+           switchResolvedOutputToDefault(audioOutput) {
+            return true
+        }
+
+        let shouldAttemptBluetoothHandoff: Bool
+        switch initialMatch {
+        case .matched(let audioOutput):
+            shouldAttemptBluetoothHandoff = defaultOutputDeviceID() != audioOutput.id
+        case .ambiguous, .notFound:
+            shouldAttemptBluetoothHandoff = true
+        }
+
+        var finalMatch = initialMatch
+        if shouldAttemptBluetoothHandoff && askBluetoothToClaimDevice(for: device) {
+            finalMatch = waitForResolvedOutput(for: device, timeout: 4.0)
+            if case .matched(let refreshedOutput) = finalMatch,
+               switchResolvedOutputToDefault(refreshedOutput) {
+                return true
+            }
+        }
+
+        logOutputResolutionFailure(for: device, match: finalMatch)
+        return false
     }
 
     @discardableResult
@@ -1832,7 +2016,7 @@ struct ContentView: View {
     @State private var showLog = false
 
     private func selectedDeviceTitle(_ device: AirPodsDevice) -> String {
-        engine.allDevices.count > 1 ? device.pickerLabel : device.name
+        device.name
     }
 
     private func t(en: String, zh: String, ja: String) -> String {
@@ -1981,10 +2165,14 @@ struct ContentView: View {
                 Divider().opacity(0.5)
             }
 
-            // 电量圆环 - 横排
+            // 电量圆环 - 横排（只显示有数据的）
             HStack(spacing: 20) {
-                BatteryRing(label: t(en: "Left", zh: "左耳", ja: "左"), percent: Int(dev.batteryLeft.replacingOccurrences(of: "%", with: "")) ?? 0, icon: "ear")
-                BatteryRing(label: t(en: "Right", zh: "右耳", ja: "右"), percent: Int(dev.batteryRight.replacingOccurrences(of: "%", with: "")) ?? 0, icon: "ear")
+                if dev.batteryLeft != "-", let pctL = Int(dev.batteryLeft.replacingOccurrences(of: "%", with: "")) {
+                    BatteryRing(label: t(en: "Left", zh: "左耳", ja: "左"), percent: pctL, icon: "ear")
+                }
+                if dev.batteryRight != "-", let pctR = Int(dev.batteryRight.replacingOccurrences(of: "%", with: "")) {
+                    BatteryRing(label: t(en: "Right", zh: "右耳", ja: "右"), percent: pctR, icon: "ear")
+                }
                 if dev.batteryCase != "-", let pct = Int(dev.batteryCase.replacingOccurrences(of: "%", with: "")) {
                     BatteryRing(label: t(en: "Case", zh: "充电盒", ja: "ケース"), percent: pct, icon: "case")
                 }

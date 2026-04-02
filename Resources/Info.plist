@@ -1,26 +1,28 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
-<dict>
-	<key>CFBundleExecutable</key>
-	<string>airpods-fix</string>
-	<key>CFBundleIdentifier</key>
-	<string>com.joewongjc.airpods-test-repair</string>
-	<key>CFBundleName</key>
-	<string>AirPods Fix</string>
-	<key>CFBundleDisplayName</key>
-	<string>AirPods Fix</string>
-	<key>CFBundleVersion</key>
-    <string>1.0.1</string>
-	<key>CFBundleShortVersionString</key>
-    <string>1.0.1</string>
-	<key>CFBundlePackageType</key>
-	<string>APPL</string>
-	<key>CFBundleIconFile</key>
-	<string>AppIcon</string>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>AirPods Fix 需要麦克风权限来测试 AirPods 麦克风是否正常工作</string>
-	<key>LSUIElement</key>
-	<false/>
-</dict>
+	<dict>
+		<key>CFBundleExecutable</key>
+		<string>airpods-fix</string>
+		<key>CFBundleIdentifier</key>
+		<string>com.joewongjc.airpods-test-repair</string>
+		<key>CFBundleName</key>
+		<string>AirPods Fix</string>
+		<key>CFBundleDisplayName</key>
+		<string>AirPods Fix</string>
+		<key>CFBundleVersion</key>
+		<string>1.0.1</string>
+		<key>CFBundleShortVersionString</key>
+		<string>1.0.1</string>
+		<key>CFBundlePackageType</key>
+		<string>APPL</string>
+		<key>CFBundleIconFile</key>
+		<string>AppIcon</string>
+		<key>NSMicrophoneUsageDescription</key>
+		<string>AirPods Fix 需要麦克风权限来测试 AirPods 麦克风是否正常工作</string>
+		<key>NSBluetoothAlwaysUsageDescription</key>
+		<string>AirPods Fix needs Bluetooth access to reconnect your headset and switch the audio output</string>
+		<key>LSUIElement</key>
+		<false/>
+	</dict>
 </plist>

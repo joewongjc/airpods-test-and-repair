@@ -3,6 +3,9 @@
 .build/
 dist/
 
+# Cursor / local tooling
+.cursor/
+
 # macOS
 .DS_Store
 *.swp
