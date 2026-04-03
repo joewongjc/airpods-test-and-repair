@@ -2,136 +2,88 @@
 
 # AirPods Fix
 
-一个原生 macOS 应用，专门用来诊断和修复 AirPods 音频问题。
+一个原生 macOS 应用，用来诊断和修复常见的 AirPods 音频问题。
 
-AirPods 连上了但没声音、音质不对、麦克风不好使？这个工具帮你定位问题并修复，不用重启 Mac。
+它主要解决 macOS 上最常见的几类麻烦：AirPods 明明连上了却没声音、系统把声音送错设备、音频退化成单声道 / 通话模式、音量实际上接近关掉，或者你只是想快速确认麦克风链路是否正常。
 
-## 功能
+虽然这个 app 还是叫 AirPods Fix，但底层的音频诊断和修复流程也能帮到很多能正常暴露为 macOS 音频输出的蓝牙耳机。
 
-### 设备检测与电量
+## 普通用户
 
-- 自动扫描已连接的 AirPods（通过蓝牙）
-- 实时显示左耳、右耳、充电盒的电量
-- 颜色状态指示（绿/黄/红）
+如果你只是想使用这个工具，直接下载 [GitHub Releases](https://github.com/XiXiphus/airpods-test-and-repair/releases) 里的打包版。
 
-### 音频诊断
+1. 下载最新 `.dmg`
+2. 打开磁盘镜像
+3. 把 `AirPods Fix.app` 拖到 `Applications`
+4. 正常启动 app
 
-- 检查 AirPods 是否为当前默认输出设备
-- 检测音频通道配置（立体声 / 单声道）
-- 读取采样率（24kHz、44.1kHz、48kHz）并识别当前模式：
-  - **立体声模式**（44.1kHz/48kHz）：完整音质
-  - **单声道 24kHz**：音质降低，通常是路由问题
-  - **通话模式**（8kHz/16kHz）：麦克风激活，扬声器音质下降
-- 监控系统音量和静音状态
-- 异常标记：输出设备不对、已静音、音量极低
+只是运行 release 版的话，一般不需要 Xcode、Xcode Command Line Tools、Homebrew 或本地 Swift 工具链。
 
-### 扬声器测试
+当前 release 可能还是未签名版本。如果 macOS 首次启动时拦截了 app，请对 app 点右键选择“打开”，或者到“系统设置 -> 隐私与安全性”里手动允许后再启动。
 
-播放系统测试音（Ping + Glass），确认两只耳机都能正常出声。
+如果同时连接了多副兼容耳机，先在 app 里选中目标设备，再执行修复。
 
-### 麦克风测试
+## 开发者
 
-实时麦克风电平监测：
+只有在你要参与开发时，才需要从源码构建。
 
-- 基于 RMS 的电平条，带平滑动画
-- 信号强度指示：无信号 / 微弱 / 正常 / 较响 / 很响
-- 峰值标记，自动衰减
-- 渐变色彩条（绿 -> 黄 -> 橙 -> 红）
-- 静音自动重试（处理权限授予延迟）
+- macOS 13 或更高版本
+- Xcode Command Line Tools
 
-### 音频修复（3 级）
+常用命令：
 
-**1. 软修复** - 刷新音频路由（不中断服务）
+```bash
+./build.sh
+./package-release.sh
+```
 
-- 如果静音则取消静音
-- 如果音量低于 10% 则调高
-- 先切换到内置扬声器，再切回 AirPods
-- 强制 macOS 重建音频路由，不动核心服务
+- `./build.sh` 生成 `AirPods Fix.app`
+- `./package-release.sh` 生成发布用 `.dmg`
+- push `v*` tag 后，[GitHub Actions](https://github.com/XiXiphus/airpods-test-and-repair/actions) 会自动构建并发布 release 产物
 
-**2. 中修复** - 重启 `coreaudiod`
+更详细的打包和发布说明见 [RUNTIME.md](RUNTIME.md)。
 
-- 终止并重启 macOS 核心音频守护进程
-- 短暂音频中断（约 3 秒）
-- 恢复后重新诊断音频状态
+## 运行时依赖
 
-**3. 硬修复** - 蓝牙重连
+Release 构建应当把 `blueutil` 一起打进 app。
 
-- 通过 `blueutil` 断开 AirPods
-- 等待蓝牙握手完全关闭
-- 重新连接并重建音频通道
-- 连接后运行诊断验证结果
+- release 版正常情况下自带 `blueutil`，蓝牙重连可直接使用
+- 本地构建会优先使用系统里已有的 `blueutil`
+- 如果缺少 `blueutil`，app 仍然可以使用扫描、诊断、扬声器测试、麦克风测试、刷新音频路由和重启 `coreaudiod`
+- 如果缺少 `blueutil`，只有蓝牙重连步骤不可用
 
-每级修复都有实时进度条和步骤描述。
+麦克风权限只会在你运行麦克风测试时请求。
 
-### 诊断日志
+## 这个 App 做什么
 
-可展开的日志面板，带时间戳，记录每一步操作，方便排查问题。
+- 检测已连接的 AirPods 或兼容耳机；如果系统能提供电量数据，就显示左耳、右耳和充电盒电量
+- 支持同时连接多副兼容耳机，并明确选择要修哪一副
+- 右上角提供运行时语言切换，下拉菜单支持英文、简体中文和日文
+- 过滤掉不能映射到真实音频输出的重复蓝牙 beacon 条目
+- 诊断输出路由、立体声 / 单声道模式、采样率、静音状态和低音量
+- 提供扬声器测试和麦克风测试
+- 提供一键修复，按阶段依次尝试：
+  - 刷新音频路由
+  - 重启 `coreaudiod`
+  - 条件允许时重连蓝牙
+- 在刷新音频路由前先临时静音，完成后恢复原来的静音状态，避免切到 MacBook 扬声器时突然外放
+- 保留带时间戳的日志，方便排查
+
+## 快速使用
+
+1. 把 AirPods 连接到 Mac
+2. 打开 app，等待自动扫描
+3. 如果连接了多副 AirPods，先选择目标设备
+4. 查看诊断区域
+5. 按需运行扬声器或麦克风测试
+6. 如果需要，可在右上角菜单切换界面语言
+7. 如果音频链路仍然异常，使用**一键修复**
 
 ## 系统要求
 
 - macOS 13 (Ventura) 或更高版本
-- [blueutil](https://github.com/toy/blueutil) - 蓝牙控制工具（`brew install blueutil`）
-- AirPods（任何一代）或 AirPods Pro
-
-## 构建
-
-```bash
-git clone https://github.com/joewongjc/airpods-test-and-repair.git
-cd airpods-test-and-repair
-./build.sh
-```
-
-不需要 Xcode，只要 Xcode Command Line Tools 里自带的 Swift 工具链。
-
-## 安装
-
-构建完成后，把 app 移到你喜欢的位置：
-
-```bash
-# 用户应用目录
-cp -r "AirPods Fix.app" ~/Applications/
-
-# 或者系统应用目录（需要管理员权限）
-sudo cp -r "AirPods Fix.app" /Applications/
-```
-
-也可以直接双击 `AirPods Fix.app` 运行，不用安装。
-
-## 使用方法
-
-1. 把 AirPods 连上 Mac
-2. 打开应用，自动扫描已连接的 AirPods
-3. 查看诊断面板，红色指示器代表有问题
-4. 用**扬声器测试**确认音频输出
-5. 用**麦克风测试**确认麦克风输入
-6. 有问题就点**重启音频服务**修复
-
-### 症状对照表
-
-| 症状 | 推荐修复 |
-|---|---|
-| 连上了但没声音 | 软修复（刷新音频路由） |
-| 声音断断续续 | 中修复（重启 coreaudiod） |
-| 一只耳机没声音 | 硬修复（蓝牙重连） |
-| 卡在单声道/通话模式 | 中修复，然后检查是否有通话应用在运行 |
-| 麦克风收不到声音 | 硬修复（重连会重建音频通道） |
-
-## 工作原理
-
-这是一个单文件 SwiftUI 应用（约 1200 行），使用：
-
-- **CoreAudio API** 直接切换音频设备（比 AppleScript 更快更稳）
-- **AVFoundation** 实时麦克风电平监测
-- **system_profiler** 读取蓝牙设备信息和电量
-- **blueutil** 程序化蓝牙断开/重连
-- **osascript** 音量和静音控制
-
-Unicode 归一化处理 macOS 智能引号（比如 AirPods Pro 设备名中的弯引号），避免匹配失败。
-
-## 权限
-
-应用会请求**麦克风权限**用于麦克风测试功能。这是可选的，其他所有功能不需要麦克风权限。
+- AirPods、AirPods Pro，或任何能正常暴露为 macOS 音频输出且提供足够设备元数据用于匹配的蓝牙耳机
 
 ## 许可证
 
-MIT
+[MIT](LICENSE)

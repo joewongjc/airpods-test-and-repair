@@ -1,6 +1,10 @@
 # Build output
 *.app/
 .build/
+dist/
+
+# Cursor / local tooling
+.cursor/
 
 # macOS
 .DS_Store
